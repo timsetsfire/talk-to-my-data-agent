@@ -652,7 +652,7 @@ class CodeGeneration(SanitizedJsonModel):
 RuntimeCredentialType = Literal["llm", "db"]
 
 
-DatabaseConnectionType = Literal["snowflake", "bigquery", "sap", "no_database"]
+DatabaseConnectionType = Literal["snowflake", "bigquery", "sap", "databricks", "no_database"]
 
 
 class AppInfra(BaseModel):

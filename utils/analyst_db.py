@@ -121,7 +121,8 @@ def get_data_source_type(value: str) -> DataSourceType:
     Returns:
         DataSourceType: The corresponding data source type.
     """
-    if value in InternalDataSourceType:
+    # Check if the value matches any enum value (Python 3.11+ compatible)
+    if value in InternalDataSourceType._value2member_map_:
         return InternalDataSourceType(value)
     elif DATA_STORE_TYPE_REGEX.match(value):
         return ExternalDataStoreNameDataSourceType(name=value)
