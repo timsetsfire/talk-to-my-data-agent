@@ -27,6 +27,7 @@ from openai.types.chat.chat_completion_system_message_param import (
 
 from utils.analyst_db import AnalystDB
 from utils.credentials import (
+    DatabricksCredentials,
     GoogleCredentialsBQ,
     NoDatabaseCredentials,
     SAPDatasphereCredentials,
@@ -53,6 +54,11 @@ class BigQueryCredentialArgs:
 @dataclass
 class SAPDatasphereCredentialArgs:
     credentials: SAPDatasphereCredentials
+
+
+@dataclass
+class DatabricksCredentialArgs:
+    credentials: DatabricksCredentials
 
 
 @dataclass

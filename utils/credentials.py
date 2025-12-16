@@ -280,5 +280,58 @@ class SAPDatasphereCredentials(DRCredentials):
         return bool(self.host and self.port and self.user and self.password)
 
 
+class DatabricksCredentials(DRCredentials):
+    """
+    Credentials for connecting to Databricks SQL.
+    
+    Databricks SQL uses Unity Catalog for governance when available.
+    The connection uses personal access tokens (PAT) for authentication.
+    """
+
+    server_hostname: str = Field(
+        validation_alias=AliasChoices(
+            AliasPath("MLOPS_RUNTIME_PARAM_DATABRICKS_SERVER_HOSTNAME"),
+            "DATABRICKS_SERVER_HOSTNAME",
+        ),
+    )
+    http_path: str = Field(
+        validation_alias=AliasChoices(
+            AliasPath("MLOPS_RUNTIME_PARAM_DATABRICKS_HTTP_PATH"),
+            "DATABRICKS_HTTP_PATH",
+        ),
+    )
+    access_token: str = Field(
+        validation_alias=AliasChoices(
+            AliasPath("MLOPS_RUNTIME_PARAM_db_credential", "payload", "apiToken"),
+            AliasPath("MLOPS_RUNTIME_PARAM_DATABRICKS_TOKEN"),
+            "DATABRICKS_TOKEN",
+        ),
+    )
+    catalog: str = Field(
+        default="hive_metastore",
+        validation_alias=AliasChoices(
+            AliasPath("MLOPS_RUNTIME_PARAM_DATABRICKS_CATALOG"),
+            "DATABRICKS_CATALOG",
+        ),
+    )
+    db_schema: str = Field(
+        validation_alias=AliasChoices(
+            AliasPath("MLOPS_RUNTIME_PARAM_DATABRICKS_SCHEMA"),
+            "DATABRICKS_SCHEMA",
+        ),
+    )
+
+    def is_configured(self) -> bool:
+        """
+        Check if Databricks credentials are properly configured.
+        """
+        return bool(
+            self.server_hostname
+            and self.http_path
+            and self.access_token
+            and self.db_schema
+        )
+
+
 class NoDatabaseCredentials(DRCredentials):
     pass

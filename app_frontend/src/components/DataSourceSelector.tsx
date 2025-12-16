@@ -46,7 +46,7 @@ export const DataSourceSelector: React.FC<DataSourceSelectorProps> = ({ value, o
         </Label>
         <p className="text-muted-foreground font-normal">
           {t(
-            'Select tables from the application-configured database. This option supports Snowflake, SAP DataSphere, and BigQuery.'
+            'Select tables from the application-configured database. This option supports Snowflake, SAP DataSphere, BigQuery, and Databricks.'
           )}
         </p>
       </div>

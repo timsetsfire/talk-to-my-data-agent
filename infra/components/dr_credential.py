@@ -27,6 +27,7 @@ from datarobot_pulumi_utils.schema.llms import LLMConfig, LLMs
 from utils.credentials import (
     AWSBedrockCredentials,
     AzureOpenAICredentials,
+    DatabricksCredentials,
     DRCredentials,
     GoogleCredentials,
     GoogleCredentialsBQ,
@@ -218,6 +219,35 @@ def get_credential_runtime_parameter_values(
             },
             {
                 "key": "SAP_DATASPHERE_SCHEMA",
+                "type": "string",
+                "value": credentials.db_schema,
+            },
+        ]
+        credential_rtp_dicts = [rtp for rtp in rtps if rtp["value"] is not None]
+    elif isinstance(credentials, DatabricksCredentials):
+        rtps = [
+            {
+                "key": "db_credential",
+                "type": "credential",
+                "value": credentials.access_token,
+            },
+            {
+                "key": "DATABRICKS_SERVER_HOSTNAME",
+                "type": "string",
+                "value": credentials.server_hostname,
+            },
+            {
+                "key": "DATABRICKS_HTTP_PATH",
+                "type": "string",
+                "value": credentials.http_path,
+            },
+            {
+                "key": "DATABRICKS_CATALOG",
+                "type": "string",
+                "value": credentials.catalog,
+            },
+            {
+                "key": "DATABRICKS_SCHEMA",
                 "type": "string",
                 "value": credentials.db_schema,
             },
@@ -456,12 +486,14 @@ def get_database_credentials(
     | GoogleCredentialsBQ
     | SAPDatasphereCredentials
     | NoDatabaseCredentials
+    | DatabricksCredentials
 ):
     credentials: (
         SnowflakeCredentials
         | GoogleCredentialsBQ
         | SAPDatasphereCredentials
         | NoDatabaseCredentials
+        | DatabricksCredentials
     )
 
     try:
@@ -564,6 +596,58 @@ def get_database_credentials(
                     connection.close()
                 except Exception as e:
                     raise ValueError("Failed to connect to SAP Data Sphere.") from e
+            return credentials
+
+        elif database == "databricks":
+            credentials = DatabricksCredentials()
+            if not credentials.is_configured():
+                logger.error("Databricks credentials not fully configured")
+                raise ValueError(
+                    textwrap.dedent(
+                        f"""
+                        Your Databricks credentials and environment variables were not configured properly.
+                        
+                        Required environment variables:
+                        - DATABRICKS_SERVER_HOSTNAME
+                        - DATABRICKS_HTTP_PATH
+                        - DATABRICKS_TOKEN
+                        - DATABRICKS_SCHEMA
+                        
+                        Optional:
+                        - DATABRICKS_CATALOG (defaults to hive_metastore)
+                        
+                        Please validate your environment variables or check {__file__} for details.
+                        """
+                    )
+                )
+
+            if test_credentials:
+                from databricks import sql as databricks_sql
+
+                try:
+                    connection = databricks_sql.connect(
+                        server_hostname=credentials.server_hostname,
+                        http_path=credentials.http_path,
+                        access_token=credentials.access_token,
+                        catalog=credentials.catalog,
+                        schema=credentials.db_schema,
+                    )
+                    cursor = connection.cursor()
+                    cursor.execute("SELECT 1")
+                    cursor.close()
+                    connection.close()
+                except Exception as e:
+                    logger.exception("Failed to test Databricks connection")
+                    raise ValueError(
+                        textwrap.dedent(
+                            f"""
+                            Unable to run a successful test of Databricks with the given credentials.
+
+                            Please validate your credentials or check {__file__} for details.
+                            """
+                        )
+                    ) from e
+
             return credentials
 
     except pydantic.ValidationError as exc:

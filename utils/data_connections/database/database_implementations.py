@@ -34,6 +34,7 @@ from pydantic import ValidationError
 from utils.analyst_db import AnalystDB, InternalDataSourceType
 from utils.code_execution import InvalidGeneratedCode
 from utils.credentials import (
+    DatabricksCredentials,
     GoogleCredentialsBQ,
     NoDatabaseCredentials,
     SAPDatasphereCredentials,
@@ -43,6 +44,7 @@ from utils.data_connections.database.database_interface import (
     _DEFAULT_DB_QUERY_TIMEOUT,
     BigQueryCredentialArgs,
     DatabaseOperator,
+    DatabricksCredentialArgs,
     NoDatabaseOperator,
     SAPDatasphereCredentialArgs,
     SnowflakeCredentialArgs,
@@ -52,6 +54,7 @@ from utils.data_connections.datarobot.datarobot_dataset_handler import (
 )
 from utils.prompts import (
     SYSTEM_PROMPT_BIGQUERY,
+    SYSTEM_PROMPT_DATABRICKS,
     SYSTEM_PROMPT_SAP_DATASPHERE,
     SYSTEM_PROMPT_SNOWFLAKE,
 )
@@ -773,6 +776,284 @@ class SAPDatasphereOperator(DatabaseOperator[SAPDatasphereCredentialArgs]):
         )
 
 
+class DatabricksOperator(DatabaseOperator[DatabricksCredentialArgs]):
+    """Operator for connecting to Databricks SQL warehouses.
+    
+    This operator connects to Databricks using the databricks-sql-connector
+    and can query Delta Lake tables through Unity Catalog or the legacy
+    hive_metastore catalog.
+    """
+
+    def __init__(
+        self,
+        credentials: DatabricksCredentials,
+        default_timeout: int = _DEFAULT_DB_QUERY_TIMEOUT,
+    ):
+        if not credentials.is_configured():
+            raise ValueError("Databricks credentials not properly configured")
+        self._credentials = credentials
+        self.default_timeout = default_timeout
+
+    @asynccontextmanager
+    async def create_connection(self) -> AsyncGenerator[Any, None]:
+        """Create a connection to Databricks SQL warehouse"""
+        from databricks import sql as databricks_sql
+
+        if not self._credentials.is_configured():
+            raise ValueError("Databricks credentials not properly configured")
+
+        loop = asyncio.get_running_loop()
+
+        connection = await loop.run_in_executor(
+            None,
+            lambda: databricks_sql.connect(
+                server_hostname=self._credentials.server_hostname,
+                http_path=self._credentials.http_path,
+                access_token=self._credentials.access_token,
+                catalog=self._credentials.catalog,
+                schema=self._credentials.db_schema,
+            ),
+        )
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    async def execute_query(
+        self, query: str, timeout: int | None = None
+    ) -> list[tuple[Any, ...]] | list[dict[str, Any]]:
+        """Execute a Databricks SQL query with timeout
+
+        Args:
+            query: SQL query to execute
+            timeout: Query timeout in seconds
+
+        Returns:
+            Query results as list of dictionaries
+        """
+        timeout = timeout if timeout is not None else self.default_timeout
+        loop = asyncio.get_running_loop()
+
+        try:
+            async with self.create_connection() as conn:
+                cursor = await loop.run_in_executor(None, conn.cursor)
+                try:
+                    # Execute query
+                    await loop.run_in_executor(None, cursor.execute, query)
+
+                    # Get column names from description
+                    columns = [desc[0] for desc in cursor.description]
+
+                    # Get results
+                    rows = await loop.run_in_executor(None, cursor.fetchall)
+
+                    # Convert to list of dicts
+                    results = [dict(zip(columns, row)) for row in rows]
+
+                    return results
+
+                except Exception as e:
+                    raise InvalidGeneratedCode(
+                        f"Databricks SQL error: {str(e)}",
+                        code=query,
+                        exception=None,
+                        traceback_str="",
+                    )
+                finally:
+                    cursor.close()
+
+        except Exception as e:
+            raise InvalidGeneratedCode(
+                f"Query execution failed: {str(e)}",
+                code=query,
+                exception=e,
+                traceback_str=traceback.format_exc(),
+            )
+
+    async def get_tables(self, timeout: int | None = None) -> list[str]:
+        """Fetch list of tables from Databricks schema
+        
+        Handles both Unity Catalog and legacy Hive metastore (spark_catalog).
+        """
+        timeout = timeout if timeout is not None else self.default_timeout
+        loop = asyncio.get_running_loop()
+
+        try:
+            async with self.create_connection() as conn:
+                cursor = await loop.run_in_executor(None, conn.cursor)
+                try:
+                    # Try Unity Catalog's information_schema first
+                    # Fall back to SHOW TABLES for legacy hive metastore (spark_catalog)
+                    try:
+                        await loop.run_in_executor(
+                            None,
+                            cursor.execute,
+                            f"""
+                            SELECT table_name
+                            FROM `{self._credentials.catalog}`.information_schema.tables
+                            WHERE table_schema = '{self._credentials.db_schema}'
+                            AND table_type IN ('MANAGED', 'EXTERNAL', 'VIEW')
+                            ORDER BY table_name
+                            """,
+                        )
+                        rows = await loop.run_in_executor(None, cursor.fetchall)
+                        tables = [row[0] for row in rows]
+                    except Exception as info_schema_error:
+                        # Fallback for legacy hive metastore (spark_catalog)
+                        logger.info(
+                            f"information_schema not available, using SHOW TABLES: {info_schema_error}"
+                        )
+                        await loop.run_in_executor(
+                            None,
+                            cursor.execute,
+                            f"SHOW TABLES IN `{self._credentials.catalog}`.`{self._credentials.db_schema}`",
+                        )
+                        rows = await loop.run_in_executor(None, cursor.fetchall)
+                        # SHOW TABLES returns: (database, tableName, isTemporary)
+                        tables = [row[1] if len(row) > 1 else row[0] for row in rows]
+
+                    logger.info(f"Total objects found: {len(tables)}")
+                    for table_name in tables:
+                        logger.info(f"Found table: {table_name}")
+
+                    return tables
+
+                finally:
+                    cursor.close()
+
+        except Exception as e:
+            logger.error(f"Failed to fetch tables from Databricks: {str(e)}", exc_info=True)
+            return []
+
+    @functools.lru_cache(maxsize=8)
+    async def get_data(
+        self,
+        *table_names: str,
+        analyst_db: AnalystDB,
+        sample_size: int = 5000,
+        timeout: int | None = None,
+    ) -> list[str]:
+        """Load selected tables from Databricks as DataFrames
+
+        Args:
+        - table_names: List of table names to fetch
+        - sample_size: Number of rows to sample from each table
+        - timeout: Query timeout in seconds
+
+        Returns:
+        - List of registered dataset names
+        """
+        timeout = timeout if timeout is not None else self.default_timeout
+        loop = asyncio.get_running_loop()
+        dataframes = []
+
+        try:
+            async with self.create_connection() as conn:
+                cursor = await loop.run_in_executor(None, conn.cursor)
+                try:
+                    for table in table_names:
+                        try:
+                            qualified_table = f"`{self._credentials.catalog}`.`{self._credentials.db_schema}`.`{table}`"
+                            logger.info(f"Fetching data from table: {qualified_table}")
+
+                            # Get column types - try information_schema first, fall back to DESCRIBE
+                            try:
+                                await loop.run_in_executor(
+                                    None,
+                                    cursor.execute,
+                                    f"""
+                                    SELECT column_name, data_type
+                                    FROM `{self._credentials.catalog}`.information_schema.columns
+                                    WHERE table_schema = '{self._credentials.db_schema}'
+                                    AND table_name = '{table}'
+                                    ORDER BY ordinal_position
+                                    """,
+                                )
+                                column_type_rows = await loop.run_in_executor(
+                                    None, cursor.fetchall
+                                )
+                                column_types = {row[0]: row[1] for row in column_type_rows}
+                            except Exception:
+                                # Fallback for legacy hive metastore - use DESCRIBE TABLE
+                                await loop.run_in_executor(
+                                    None,
+                                    cursor.execute,
+                                    f"DESCRIBE TABLE {qualified_table}",
+                                )
+                                describe_rows = await loop.run_in_executor(
+                                    None, cursor.fetchall
+                                )
+                                # DESCRIBE returns: (col_name, data_type, comment)
+                                column_types = {row[0]: row[1] for row in describe_rows if row[0] and not row[0].startswith("#")}
+
+                            # Fetch data with limit
+                            await loop.run_in_executor(
+                                None,
+                                cursor.execute,
+                                f"""
+                                SELECT * FROM {qualified_table}
+                                LIMIT {sample_size}
+                                """,
+                            )
+
+                            columns = [desc[0] for desc in cursor.description]
+                            data = await loop.run_in_executor(None, cursor.fetchall)
+                            schema = [
+                                {
+                                    "name": col,
+                                    "dataType": column_types.get(col, "STRING"),
+                                }
+                                for col in columns
+                            ]
+
+                            df = BaseRecipe.convert_preview_to_dataframe(schema, data)
+
+                            logger.info(
+                                f"Successfully loaded table {table}: {len(df.df)} rows, {len(df.df.columns)} columns"
+                            )
+                            dataframes.append(
+                                (AnalystDataset(name=table, data=df), column_types)
+                            )
+
+                        except Exception as e:
+                            logger.error(
+                                f"Error loading table {table}: {str(e)}", exc_info=True
+                            )
+                            continue
+
+                finally:
+                    cursor.close()
+
+                # Register datasets
+                names = []
+                for dataframe, column_types in dataframes:
+                    await analyst_db.register_dataset(
+                        dataframe,
+                        InternalDataSourceType.DATABASE,
+                        original_column_types=column_types,
+                        clobber=True,
+                    )
+                    names.append(dataframe.name)
+                return names
+
+        except Exception as e:
+            logger.error(f"Error fetching Databricks data: {str(e)}", exc_info=True)
+            return []
+
+    def get_system_prompt(self) -> ChatCompletionSystemMessageParam:
+        return ChatCompletionSystemMessageParam(
+            role="system",
+            content=SYSTEM_PROMPT_DATABRICKS.format(
+                catalog=self._credentials.catalog,
+                schema=self._credentials.db_schema,
+            ),
+        )
+
+    def query_friendly_name(self, dataset_name: str) -> str:
+        """Return a fully qualified table name for Databricks."""
+        return f"`{self._credentials.catalog}`.`{self._credentials.db_schema}`.`{dataset_name}`"
+
+
 def get_database_operator(app_infra: AppInfra) -> DatabaseOperator[Any]:
     logger.info("Loading database %s", app_infra.database)
     if app_infra.database == "bigquery":
@@ -780,6 +1061,7 @@ def get_database_operator(app_infra: AppInfra) -> DatabaseOperator[Any]:
             GoogleCredentialsBQ
             | SnowflakeCredentials
             | SAPDatasphereCredentials
+            | DatabricksCredentials
             | NoDatabaseCredentials
         )
         try:
@@ -810,6 +1092,17 @@ def get_database_operator(app_infra: AppInfra) -> DatabaseOperator[Any]:
         except (ValidationError, ValueError):
             logger.warning(
                 "SAP credentials not properly configured, falling back to no database"
+            )
+        return NoDatabaseOperator(NoDatabaseCredentials())
+    elif app_infra.database == "databricks":
+        try:
+            credentials = DatabricksCredentials()
+            if credentials.is_configured():
+                return cast(DatabaseOperator[Any], DatabricksOperator(credentials))
+        except (ValidationError, ValueError) as e:
+            logger.warning(f"Databricks credentials not properly configured: {str(e)}", exc_info=True)
+            logger.warning(
+                "Databricks credentials not properly configured, falling back to no database"
             )
         return NoDatabaseOperator(NoDatabaseCredentials())
     else:

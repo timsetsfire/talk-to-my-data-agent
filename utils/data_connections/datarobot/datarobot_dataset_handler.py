@@ -22,6 +22,7 @@ import abc
 import asyncio
 import concurrent.futures
 import datetime
+import decimal
 import json
 import logging
 import threading
@@ -532,11 +533,18 @@ class BaseRecipe(abc.ABC):
             for col in schema
         }
 
+        def convert_value(v: Any) -> Any:
+            """Convert values that Polars can't handle directly."""
+            if isinstance(v, datetime.datetime):
+                return str(v)
+            elif isinstance(v, datetime.date):
+                return str(v)
+            elif isinstance(v, decimal.Decimal):
+                return float(v)
+            return v
+
         df = pl.DataFrame(
-            [
-                [str(v) if isinstance(v, datetime.datetime) else v for v in row]
-                for row in all_rows
-            ],
+            [[convert_value(v) for v in row] for row in all_rows],
             schema={k: str for k in polars_schema},
             orient="row",
             strict=False,
@@ -626,10 +634,12 @@ class BaseRecipe(abc.ABC):
             "BIGINT": pl.Decimal(),  # DuckDB / arrow doesn't support Int128
             "TINYINT": pl.Int64(),
             "BYTEINT": pl.Int64(),
+            "LONG": pl.Int64(),  # Databricks LONG type
             "BIT": pl.Boolean(),
             "BOOL": pl.Boolean(),  # also covers "Boolean"
             "BYTE": pl.Binary(),  # also covers BYTEA/BYTEARRAY
             "VARBINARY": pl.Binary(),
+            "BINARY": pl.Binary(),  # Databricks BINARY type
             "VARCHAR": pl.String(),
             "NVARCHAR": pl.String(),
             "CHAR": pl.String(),
@@ -637,8 +647,10 @@ class BaseRecipe(abc.ABC):
             "TEXT": pl.String(),
             "NTEXT": pl.String(),
             "BPCHAR": pl.String(),
+            "STRING": pl.String(),  # Databricks STRING type
             "DATE": pl.Datetime(),
             "TIME": pl.Datetime(),
+            "TIMESTAMP": pl.Datetime(),  # Databricks TIMESTAMP type
         }
 
         matches = []
